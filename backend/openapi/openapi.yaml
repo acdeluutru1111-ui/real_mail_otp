@@ -1,0 +1,668 @@
+openapi: 3.1.0
+info:
+  title: real-mail-otp backend API
+  version: 0.1.0
+  description: >
+    Temporary inbox + pay-per-read (single credit wallet, 200 VND / read) service.
+    Every response carries request_id. Errors use the common envelope
+    {error:{code,message,retryable}, request_id}. Cookie/key/payload/body/OTP are
+    never returned in any schema.
+servers:
+  - url: /
+tags:
+  - name: health
+  - name: auth
+  - name: inboxes
+  - name: messages
+  - name: billing
+  - name: payments
+  - name: admin
+
+paths:
+  /health/live:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: live }
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe (DB + config, not upstream)
+      responses:
+        "200":
+          description: Ready
+        "503":
+          description: Not ready
+
+  # --- Auth endpoints (P1-02) ---
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuthRegisterRequest" }
+      responses:
+        "201":
+          description: User created
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Login with email and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuthLoginRequest" }
+      responses:
+        "200":
+          description: Login successful
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh access token using refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: Tokens refreshed
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Logout and revoke refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LogoutRequest" }
+      responses:
+        "200":
+          description: Logged out successfully
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "Logged out successfully" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/inboxes:
+    post:
+      tags: [inboxes]
+      summary: Create a temporary inbox
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxCreateRequest"
+      responses:
+        "201":
+          description: Inbox created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Inbox" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamInvalid" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+        "504": { $ref: "#/components/responses/UpstreamTimeout" }
+    get:
+      tags: [inboxes]
+      summary: List the caller's inboxes
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Inbox page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InboxList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/inboxes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    get:
+      tags: [inboxes]
+      summary: Get inbox metadata
+      responses:
+        "200":
+          description: Inbox metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Inbox" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [inboxes]
+      summary: Soft-delete an inbox
+      responses:
+        "204":
+          description: Deleted (soft)
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/inboxes/{id}/refresh:
+    post:
+      tags: [inboxes]
+      summary: Refresh inbox (never charges; cached + single-flight)
+      parameters:
+        - $ref: "#/components/parameters/InboxId"
+      responses:
+        "200":
+          description: Refreshed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefreshResult" }
+        "202":
+          description: Refresh already in progress
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+        "504": { $ref: "#/components/responses/UpstreamTimeout" }
+
+  /v1/inboxes/{id}/messages:
+    get:
+      tags: [messages]
+      summary: List message metadata (from cache, never charges)
+      parameters:
+        - $ref: "#/components/parameters/InboxId"
+      responses:
+        "200":
+          description: Message metadata list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/inboxes/{id}/messages/{mid}:
+    get:
+      tags: [messages]
+      summary: Get message detail with billing (charge only on valid, committed read)
+      parameters:
+        - $ref: "#/components/parameters/InboxId"
+        - name: mid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Sanitized message detail + billing info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/InsufficientBalance" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamInvalid" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+        "504": { $ref: "#/components/responses/UpstreamTimeout" }
+
+  /v1/billing/balance:
+    get:
+      tags: [billing]
+      summary: Current wallet balance
+      responses:
+        "200":
+          description: Balance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balance" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/billing/ledger:
+    get:
+      tags: [billing]
+      summary: Wallet ledger entries
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Ledger page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LedgerList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/payments/qr:
+    post:
+      tags: [payments]
+      summary: Create a manual-QR payment with a unique reference
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaymentQrRequest" }
+      responses:
+        "201":
+          description: Payment created (pending)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /v1/payments/{id}/manual-proof:
+    post:
+      tags: [payments]
+      summary: Submit manual payment proof (moves to pending_review)
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ManualProofRequest" }
+      responses:
+        "200":
+          description: Proof accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/payments/{id}:
+    get:
+      tags: [payments]
+      summary: Get payment status
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # --- Admin endpoints (P0-02, P0-04) ---
+  /v1/admin/payments/{id}/approve:
+    post:
+      tags: [admin]
+      summary: Approve a payment and grant credit (admin only)
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovePaymentRequest" }
+      responses:
+        "200":
+          description: Payment approved
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/admin/payments/{id}/reverse:
+    post:
+      tags: [admin]
+      summary: Reverse a paid payment (admin only)
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReversePaymentRequest" }
+      responses:
+        "200":
+          description: Payment reversed
+          headers:
+            X-Request-ID: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LedgerEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/InsufficientBalance" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Same key + user returns the same inbox.
+      schema: { type: string }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    InboxId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Not authenticated
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: Not the resource owner
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: Idempotency / billing conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    RateLimited:
+      description: Rate limited / abuse blocked
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    InsufficientBalance:
+      description: Insufficient credit balance
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    UpstreamInvalid:
+      description: Upstream returned an invalid response
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    UpstreamUnavailable:
+      description: Upstream service unavailable
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    UpstreamTimeout:
+      description: Upstream timed out
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error, request_id]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            retryable: { type: boolean }
+        request_id: { type: string }
+
+    InboxCreateRequest:
+      type: object
+      required: [domain]
+      properties:
+        domain: { type: string, example: outlook }
+
+    Inbox:
+      type: object
+      required: [id, address, domain_type, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        address: { type: string, example: someone@example.com }
+        domain_type: { type: string, example: temp_outlook }
+        status: { type: string, enum: [active, expired, deleted] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, "null"], format: date-time }
+
+    InboxList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Inbox" }
+        next_cursor: { type: [string, "null"] }
+
+    MessageMeta:
+      type: object
+      required: [mid, subject, sender, received_at]
+      properties:
+        mid: { type: string }
+        subject: { type: string }
+        sender: { type: string }
+        snippet: { type: string }
+        received_at: { type: string, format: date-time }
+
+    MessageList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/MessageMeta" }
+
+    RefreshResult:
+      type: object
+      required: [messages, next_poll_after_seconds, refreshed_at]
+      properties:
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/MessageMeta" }
+        next_poll_after_seconds: { type: integer }
+        refreshed_at: { type: string, format: date-time }
+
+    Billing:
+      type: object
+      required: [charged, amount, source]
+      properties:
+        charged: { type: boolean }
+        amount: { type: integer, example: 200 }
+        source: { type: string, enum: [upstream, cache] }
+
+    MessageDetail:
+      type: object
+      required: [mid, subject, sender, received_at, html_sanitized, billing]
+      properties:
+        mid: { type: string }
+        subject: { type: string }
+        sender: { type: string }
+        received_at: { type: string, format: date-time }
+        html_sanitized: { type: string, description: Sanitized HTML content }
+        otp_candidates:
+          type: array
+          items: { type: string }
+        billing: { $ref: "#/components/schemas/Billing" }
+
+    Balance:
+      type: object
+      required: [balance_vnd]
+      properties:
+        balance_vnd: { type: integer, example: 20000 }
+
+    LedgerEntry:
+      type: object
+      required: [id, type, amount_vnd, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [credit, debit, reversal] }
+        amount_vnd: { type: integer }
+        reference_type: { type: string }
+        reference_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    LedgerList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/LedgerEntry" }
+        next_cursor: { type: [string, "null"] }
+
+    PaymentQrRequest:
+      type: object
+      properties:
+        package_code: { type: string, enum: [starter, popular, pro] }
+        amount_vnd: { type: integer, minimum: 1 }
+
+    ManualProofRequest:
+      type: object
+      required: [note]
+      properties:
+        note: { type: string }
+        reference: { type: string }
+
+    Payment:
+      type: object
+      required: [id, amount_vnd, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        package_code: { type: [string, "null"] }
+        amount_vnd: { type: integer }
+        provider_ref: { type: string }
+        qr_content: { type: string }
+        status:
+          type: string
+          enum: [pending, pending_review, paid, rejected, expired]
+        created_at: { type: string, format: date-time }
+        paid_at: { type: [string, "null"], format: date-time }
+
+    # --- Auth schemas (P1-02) ---
+    AuthRegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+
+    AuthLoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    LogoutRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, example: bearer }
+
+    # --- Admin schemas (P0-02, P0-04) ---
+    ApprovePaymentRequest:
+      type: object
+      properties:
+        reason: { type: string, maxLength: 500 }
+
+    ReversePaymentRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, maxLength: 500 }

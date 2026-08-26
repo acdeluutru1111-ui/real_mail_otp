@@ -1,0 +1,11 @@
+{
+  "data": [
+    {
+      "mid": "MID-2001",
+      "textSubject": "Reset your password",
+      "textFrom": "security@service.example",
+      "date": "2024-03-11T08:00:00Z",
+      "snippet": "Use code 774213 to reset"
+    }
+  ]
+}

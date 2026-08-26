@@ -1,0 +1,6 @@
+{
+  "subject": "No mid present",
+  "from": "sender@service.example",
+  "date": "2024-03-10T15:00:00Z",
+  "message": "<p>Body without mid, code 555444</p>"
+}

@@ -1,0 +1,9 @@
+[
+  {
+    "mid": "MID-3001",
+    "subject": "Bare list subject",
+    "from": "bare@service.example",
+    "date": "2024-03-12T09:00:00Z",
+    "snippet": "Bare list snippet 123456"
+  }
+]

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Strict Content-Security-Policy.
+      - default-src 'self': only load app resources from our own origin.
+      - script-src 'self': no inline/eval scripts in the app. Vite's dev server injects
+        its client via module scripts served from 'self', so no relaxation is needed in dev.
+        (If HMR ever needs it, prefer a dev-only header over loosening this production meta.)
+      - style-src 'self' 'unsafe-inline': Vite injects styles inline during dev and some
+        component styling relies on the <style>-tag mechanism. This is the only documented
+        relaxation and it does NOT enable script execution.
+      - connect-src 'self' https: : the API base URL is configured at build time via
+        VITE_API_BASE_URL and is typically a different origin; allow https backends + self.
+      - frame-src 'none': message bodies are rendered in a sandboxed iframe via srcdoc,
+        which is same-origin-less content (sandbox="") and is NOT governed by frame-src
+        (srcdoc documents inherit an opaque origin and run under the sandbox attribute).
+        We keep frame-src 'none' to block any other framing.
+      - object-src 'none', base-uri 'self', form-action 'self': lock down the rest.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://127.0.0.1:8099 http://localhost:8099; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <title>Real Mail OTP</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

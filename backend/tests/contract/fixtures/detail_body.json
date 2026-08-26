@@ -1,0 +1,9 @@
+{
+  "mid": "MID-1002",
+  "textSubject": "Body variant",
+  "textFrom": "sender@service.example",
+  "textTo": "alice.top@outlook.com",
+  "textDate": "2024-03-10T11:00:00Z",
+  "body": "<p>Login code: 246810</p>",
+  "text": "Login code: 246810"
+}

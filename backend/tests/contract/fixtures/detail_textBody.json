@@ -1,0 +1,7 @@
+{
+  "mid": "MID-1005",
+  "subject": "TextBody only variant",
+  "from": "sender@service.example",
+  "date": "2024-03-10T14:00:00Z",
+  "textBody": "Plain text only. Your code is 111222."
+}

@@ -1,0 +1,7 @@
+{
+  "mid": "MID-1004",
+  "subject": "Content variant",
+  "from": "sender@service.example",
+  "date": "2024-03-10T13:00:00Z",
+  "content": "<span>Your OTP is 909090</span>"
+}

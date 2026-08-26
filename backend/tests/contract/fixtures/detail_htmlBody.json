@@ -1,0 +1,8 @@
+{
+  "mid": "MID-1003",
+  "subject": "HtmlBody variant",
+  "from": "sender@service.example",
+  "date": "2024-03-10T12:00:00Z",
+  "htmlBody": "<div>Confirm at https://service.example/verify-email?token=HTMLTOKEN9 code 135790</div>",
+  "snippet": "Confirm your email"
+}
