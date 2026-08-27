@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { getInbox, listMessages } from '../api/endpoints';
+import { getInbox, listMessages, refreshInbox } from '../api/endpoints';
 import type { Inbox, MessageMeta, RefreshResult } from '../api/types';
 import { usePolling } from '../hooks/usePolling';
 import { POLL_SCHEDULE_SECONDS } from '../security/polling';
@@ -14,6 +14,7 @@ export function InboxDetailPage() {
   const [inbox, setInbox] = useState<Inbox | null>(null);
   const [messages, setMessages] = useState<MessageMeta[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
 
@@ -55,7 +56,25 @@ export function InboxDetailPage() {
 
   useEffect(() => {
     void loadInbox();
-  }, [loadInbox]);
+    if (id) {
+      start();
+    }
+  }, [loadInbox, id, start]);
+
+  const handleManualRefresh = async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      const res = await refreshInbox(id);
+      if (res && res.messages) {
+        setMessages(res.messages);
+      }
+    } catch (err) {
+      setError(err);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   // Live countdown to the next poll based on schedule.fireAt.
   useEffect(() => {
@@ -110,24 +129,33 @@ export function InboxDetailPage() {
           when you leave, on logout, or after 120s. Refreshing never charges.
         </p>
 
-        {!isPolling ? (
-          <button type="button" className="btn-primary" onClick={start}>
-            Start waiting for mail
-          </button>
-        ) : (
-          <div className="polling-live">
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', marginTop: '0.5rem' }}>
+          {!isPolling ? (
+            <button type="button" className="btn-primary" onClick={start}>
+              Start waiting for mail
+            </button>
+          ) : (
             <button type="button" className="btn-secondary" onClick={stop}>
               Stop waiting
             </button>
+          )}
+
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={refreshing}
+            onClick={handleManualRefresh}
+          >
+            {refreshing ? 'Refreshing…' : '🔄 Refresh now'}
+          </button>
+
+          {isPolling && (
             <span className="polling-status">
-              {countdown !== null
-                ? `Next poll in ${countdown}s`
-                : 'Polling…'}
-              {schedule &&
-                ` · poll ${schedule.pollIndex + 1}/${schedule.totalPolls}`}
+              {countdown !== null ? `Next poll in ${countdown}s` : 'Polling…'}
+              {schedule && ` · poll ${schedule.pollIndex + 1}/${schedule.totalPolls}`}
             </span>
-          </div>
-        )}
+          )}
+        </div>
 
         {!isPolling && stopReason && (
           <p className="polling-stop-reason">{stopLabel()}</p>

@@ -54,10 +54,10 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=list)
 
     # --- Rate limiting (in-process token bucket, v1) -----------------------
-    rate_limit_create_per_minute: int = Field(default=10)
-    rate_limit_list_per_minute: int = Field(default=60)
-    rate_limit_detail_per_minute: int = Field(default=30)
-    rate_limit_refresh_per_minute: int = Field(default=20)
+    rate_limit_create_per_minute: int = Field(default=30)
+    rate_limit_list_per_minute: int = Field(default=120)
+    rate_limit_detail_per_minute: int = Field(default=60)
+    rate_limit_refresh_per_minute: int = Field(default=60)
     # Max active inboxes per user (fair-use).
     max_active_inboxes_per_user: int = Field(default=20)
     # Comma-separated list of user IDs granted admin privileges.

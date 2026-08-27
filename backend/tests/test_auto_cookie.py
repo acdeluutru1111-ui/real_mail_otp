@@ -373,3 +373,484 @@ async def test_admin_request_and_config_bounds():
 async def test_no_unauthenticated_dev_cookie_routes_remain():
     paths = {route.path for route in admin.router.routes}
     assert not any("/dev/" in path for path in paths)
+
+
+async def test_extract_cookies_from_signin_cross_domain_forwarding_and_fallback(monkeypatch):
+    import respx
+    import httpx
+
+    settings = FakeSettings()
+    monkeypatch.setattr(cm_mod, "get_settings", lambda: settings)
+    manager = CookieManager()
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        # Step 3: Signin link sets ghost cookie
+        respx_mock.get("https://sonjj.com/members/?token=valid_token").respond(
+            status_code=200,
+            headers={"Set-Cookie": "ghost-members-ssr=ghost_val; Domain=sonjj.com; Path=/"},
+        )
+        # Step 4: Session endpoint returns JWT
+        respx_mock.get("https://sonjj.com/members/api/session").respond(
+            status_code=200,
+            json={"jwt": "header.payload.signature_xyz"},
+        )
+        # Step 5: SSO endpoint
+        respx_mock.get("https://my.sonjj.com/auth/sonjj?session=header.payload.signature_xyz").respond(
+            status_code=200,
+            headers={"Set-Cookie": "my_session=sso_val; Domain=my.sonjj.com; Path=/"},
+        )
+        # Step 6: SmailPro endpoint receives forwarded cookies and sets XSRF-TOKEN and sonjj_session
+        def smailpro_handler(request: httpx.Request):
+            cookie_header = request.headers.get("cookie", "")
+            # Ensure ghost and sso cookies were forwarded across domains in cookie header
+            assert "ghost-members-ssr=ghost_val" in cookie_header
+            assert "my_session=sso_val" in cookie_header
+            return httpx.Response(
+                status_code=200,
+                headers=[
+                    ("Set-Cookie", "XSRF-TOKEN=test%20xsrf%20token; Path=/"),
+                    ("Set-Cookie", "sonjj_session=test_session_token_123; Path=/"),
+                ],
+            )
+
+        respx_mock.get("https://smailpro.com/temporary-email").mock(side_effect=smailpro_handler)
+
+        xsrf, session = await manager._extract_cookies_from_signin("https://sonjj.com/members/?token=valid_token")
+        assert xsrf == "test xsrf token"  # unquoted
+        assert session == "test_session_token_123"
+
+
+async def test_extract_cookies_from_signin_set_cookie_header_fallback(monkeypatch):
+    import respx
+    import httpx
+
+    settings = FakeSettings()
+    monkeypatch.setattr(cm_mod, "get_settings", lambda: settings)
+    manager = CookieManager()
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/?token=fallback_token").respond(status_code=200)
+        respx_mock.get("https://sonjj.com/members/api/session").respond(
+            status_code=200,
+            json={"jwt": "jwt.test.token"},
+        )
+        respx_mock.get("https://my.sonjj.com/auth/sonjj?session=jwt.test.token").respond(status_code=200)
+        # SmailPro responds with raw Set-Cookie header string containing both cookies
+        respx_mock.get("https://smailpro.com/temporary-email").respond(
+            status_code=200,
+            headers={"Set-Cookie": "XSRF-TOKEN=encoded%20token%20abc; Path=/, sonjj_session=fallback_session_999; Path=/"},
+        )
+
+        xsrf, session = await manager._extract_cookies_from_signin("https://sonjj.com/members/?token=fallback_token")
+        assert xsrf == "encoded token abc"
+        assert session == "fallback_session_999"
+
+
+async def test_cookie_refresh_failure_maps_to_upstream_auth_error(monkeypatch):
+    adapter, manager = make_adapter(monkeypatch)
+
+    async def failing_refresh(**kwargs):
+        raise cm_mod.CookieRefreshError(
+            cm_mod.CookieRefreshStage.MAGIC_LINK_REQUEST,
+            cm_mod.CookieRefreshReason.UPSTREAM_REJECTED,
+        )
+
+    monkeypatch.setattr(manager, "refresh_cookies", failing_refresh)
+
+    async def request(method, url, **kwargs):
+        raise UpstreamAuthError()
+
+    monkeypatch.setattr(smail_mod.http_client, "request", request)
+
+    with pytest.raises(UpstreamAuthError):
+        await adapter._request_with_auth_recovery("GET", "https://example.test")
+
+
+async def test_error_handlers_attach_cors_headers(monkeypatch):
+    from starlette.requests import Request
+    from app.core.errors import app_error_handler, unhandled_exception_handler, AuthUnauthenticatedError
+
+    settings = FakeSettings()
+    settings.cors_origins = ["http://localhost:5173"]
+    monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/test",
+        "headers": [(b"origin", b"http://localhost:5173")],
+    }
+    request = Request(scope)
+
+    # 1. AppError handler
+    res1 = await app_error_handler(request, AuthUnauthenticatedError())
+    assert res1.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    assert res1.headers.get("access-control-allow-credentials") == "true"
+
+    # 2. Unhandled Exception handler
+    res2 = await unhandled_exception_handler(request, RuntimeError("unhandled"))
+    assert res2.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    assert res2.headers.get("access-control-allow-credentials") == "true"
+
+
+async def test_get_integrity_token_success_and_failure(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="sample_integrity_token_abc123\n",
+        )
+        async with httpx.AsyncClient() as client:
+            token = await manager._get_integrity_token(client)
+            assert token == "sample_integrity_token_abc123"
+
+    # Test failure on upstream error
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(status_code=500)
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(CookieRefreshError) as exc_info:
+                await manager._get_integrity_token(client)
+            assert exc_info.value.stage == cm_mod.CookieRefreshStage.MAGIC_LINK_REQUEST
+
+
+async def test_request_magic_link_with_integrity_and_otc_payload(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        def match_payload(request: httpx.Request):
+            data = json.loads(request.content)
+            assert data["email"] == "fake-refresh@example.test"
+            assert data["emailType"] == "signin"
+            assert data["requestSrc"] == "portal"
+            assert data["integrityToken"] == "my_integrity_token"
+            assert data["autoRedirect"] is True
+            assert data["includeOTC"] is True
+            assert isinstance(data["urlHistory"], list)
+            assert len(data["urlHistory"]) > 0
+            assert data["urlHistory"][0]["path"] == "/redirect-auth/"
+            assert data["urlHistory"][0]["referrerUrl"] == "https://my.sonjj.com/"
+            assert isinstance(data["urlHistory"][0]["time"], int)
+            return httpx.Response(
+                status_code=201,
+                json={"otc_ref": "test_otc_ref_999"},
+            )
+
+        respx_mock.post("https://sonjj.com/members/api/send-magic-link/").mock(side_effect=match_payload)
+
+        async with httpx.AsyncClient() as client:
+            otc_ref = await manager._request_magic_link(client, "my_integrity_token")
+            assert otc_ref == "test_otc_ref_999"
+
+
+async def test_imap_extracts_both_signin_url_and_otc_code(monkeypatch):
+    settings = FakeSettings()
+    monkeypatch.setattr(cm_mod, "get_settings", lambda: settings)
+    manager = CookieManager()
+    manager._flow_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    message = email.message.EmailMessage()
+    message["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    message["Subject"] = "987654 is your verification code"
+    message.set_content("Please sign in using this link: https://sonjj.com/members/?token=TOKEN_URL_123")
+
+    class FakeIMAP:
+        def __init__(self, *args, **kwargs):
+            pass
+        def login(self, *_):
+            return "OK", []
+        def select(self, mailbox, readonly=False):
+            return "OK", []
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"1 2"]
+            return "OK", [(b"2", message.as_bytes())]
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr(cm_mod.imaplib, "IMAP4_SSL", FakeIMAP)
+    signin_url, otc_code = manager._read_gmail_auth_sync(1.0, 0.01)
+    assert signin_url == "https://sonjj.com/members/?token=TOKEN_URL_123"
+    assert otc_code == "987654"
+
+
+async def test_imap_extracts_otc_code_only_when_url_missing(monkeypatch):
+    settings = FakeSettings()
+    monkeypatch.setattr(cm_mod, "get_settings", lambda: settings)
+    manager = CookieManager()
+    manager._flow_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    message = email.message.EmailMessage()
+    message["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    message["Subject"] = "Your OTC login code"
+    message.set_content("Your code is 112233. It expires in 10 minutes.")
+
+    class FakeIMAP:
+        def __init__(self, *args, **kwargs):
+            pass
+        def login(self, *_):
+            return "OK", []
+        def select(self, mailbox, readonly=False):
+            return "OK", []
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"5"]
+            return "OK", [(b"5", message.as_bytes())]
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr(cm_mod.imaplib, "IMAP4_SSL", FakeIMAP)
+    signin_url, otc_code = manager._read_gmail_auth_sync(1.0, 0.01)
+    assert signin_url is None
+    assert otc_code == "112233"
+
+
+async def test_imap_extracts_url_only_when_otc_missing(monkeypatch):
+    settings = FakeSettings()
+    monkeypatch.setattr(cm_mod, "get_settings", lambda: settings)
+    manager = CookieManager()
+    manager._flow_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    message = email.message.EmailMessage()
+    message["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    message["Subject"] = "Sign in to Sonjj"
+    message.set_content("Click here: https://sonjj.com/members/?token=ONLY_URL_TOKEN")
+
+    class FakeIMAP:
+        def __init__(self, *args, **kwargs):
+            pass
+        def login(self, *_):
+            return "OK", []
+        def select(self, mailbox, readonly=False):
+            return "OK", []
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"8"]
+            return "OK", [(b"8", message.as_bytes())]
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr(cm_mod.imaplib, "IMAP4_SSL", FakeIMAP)
+    signin_url, otc_code = manager._read_gmail_auth_sync(1.0, 0.01)
+    assert signin_url == "https://sonjj.com/members/?token=ONLY_URL_TOKEN"
+    assert otc_code is None
+
+
+async def test_authenticate_branch_a_signin_url_success(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/?token=direct_link").respond(status_code=200)
+
+        async with httpx.AsyncClient() as client:
+            await manager._authenticate(
+                client=client,
+                signin_url="https://sonjj.com/members/?token=direct_link",
+                otc_code="123456",
+                otc_ref="ref_xyz",
+            )
+
+
+async def test_authenticate_branch_b_otc_fallback_success(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        # Branch A fails with 400
+        respx_mock.get("https://sonjj.com/members/?token=expired_token").respond(status_code=400)
+        # Branch B fetches fresh integrity token
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="fresh_token_777",
+        )
+        # Branch B calls verify-otc
+        def match_verify_otc(request: httpx.Request):
+            data = json.loads(request.content)
+            assert data["otc"] == "654321"
+            assert data["otcRef"] == "ref_abc"
+            assert data["integrityToken"] == "fresh_token_777"
+            return httpx.Response(status_code=200, json={"status": "ok"})
+
+        respx_mock.post("https://sonjj.com/members/api/verify-otc/").mock(side_effect=match_verify_otc)
+
+        async with httpx.AsyncClient() as client:
+            await manager._authenticate(
+                client=client,
+                signin_url="https://sonjj.com/members/?token=expired_token",
+                otc_code="654321",
+                otc_ref="ref_abc",
+            )
+
+
+async def test_authenticate_fails_when_both_branches_fail(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/?token=bad_token").respond(status_code=400)
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="fresh_token_888",
+        )
+        respx_mock.post("https://sonjj.com/members/api/verify-otc/").respond(status_code=400)
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(CookieRefreshError) as exc_info:
+                await manager._authenticate(
+                    client=client,
+                    signin_url="https://sonjj.com/members/?token=bad_token",
+                    otc_code="999999",
+                    otc_ref="bad_ref",
+                )
+            assert exc_info.value.stage == cm_mod.CookieRefreshStage.SIGNIN
+            assert exc_info.value.reason_code == cm_mod.CookieRefreshReason.MAGIC_LINK_INVALID
+
+
+async def test_full_cookie_flow_e2e_direct_signin(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async def mock_imap_poll(max_wait, poll_interval):
+        return "https://sonjj.com/members/?token=valid_direct_link", "112233"
+
+    monkeypatch.setattr(manager, "_read_gmail_auth_async", mock_imap_poll)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        # 1. Integrity token
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="integrity_token_val_1",
+        )
+        # 2. Send magic link
+        respx_mock.post("https://sonjj.com/members/api/send-magic-link/").respond(
+            status_code=201,
+            json={"otc_ref": "ref_otc_direct"},
+        )
+        # 3. Direct signin link
+        respx_mock.get("https://sonjj.com/members/?token=valid_direct_link").respond(
+            status_code=200,
+            headers={"Set-Cookie": "ghost-members-ssr=direct_ghost; Domain=sonjj.com; Path=/"},
+        )
+        # 4. Session JWT
+        respx_mock.get("https://sonjj.com/members/api/session").respond(
+            status_code=200,
+            json={"jwt": "jwt_direct_session"},
+        )
+        # 5. SSO
+        respx_mock.get("https://my.sonjj.com/auth/sonjj?session=jwt_direct_session").respond(
+            status_code=200,
+            headers={"Set-Cookie": "my_session=direct_sso; Domain=my.sonjj.com; Path=/"},
+        )
+        # 6. SmailPro temporary-email
+        respx_mock.get("https://smailpro.com/temporary-email").respond(
+            status_code=200,
+            headers=[
+                ("Set-Cookie", "XSRF-TOKEN=direct_xsrf_val; Path=/"),
+                ("Set-Cookie", "sonjj_session=direct_session_val; Path=/"),
+            ],
+        )
+
+        xsrf, session = await manager._execute_cookie_flow()
+        assert xsrf == "direct_xsrf_val"
+        assert session == "direct_session_val"
+
+
+async def test_full_cookie_flow_e2e_otc_fallback(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async def mock_imap_poll(max_wait, poll_interval):
+        return "https://sonjj.com/members/?token=failed_link", "654321"
+
+    monkeypatch.setattr(manager, "_read_gmail_auth_async", mock_imap_poll)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        # 1. Initial integrity token
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="integrity_token_initial",
+        )
+        # 2. Send magic link
+        respx_mock.post("https://sonjj.com/members/api/send-magic-link/").respond(
+            status_code=201,
+            json={"otc_ref": "ref_fallback_99"},
+        )
+        # 3. Direct signin fails
+        respx_mock.get("https://sonjj.com/members/?token=failed_link").respond(status_code=400)
+        # 4. Fresh integrity token for OTC verify
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(
+            status_code=200,
+            text="integrity_token_fresh_otc",
+        )
+        # 5. Verify OTC
+        def match_verify(request: httpx.Request):
+            data = json.loads(request.content)
+            assert data["otc"] == "654321"
+            assert data["otcRef"] == "ref_fallback_99"
+            assert data["integrityToken"] == "integrity_token_fresh_otc"
+            return httpx.Response(
+                status_code=200,
+                headers={"Set-Cookie": "ghost-members-ssr=otc_ghost_val; Domain=sonjj.com; Path=/"},
+                json={"status": "ok"},
+            )
+
+        respx_mock.post("https://sonjj.com/members/api/verify-otc/").mock(side_effect=match_verify)
+        # 6. Session JWT
+        respx_mock.get("https://sonjj.com/members/api/session").respond(
+            status_code=200,
+            json={"jwt": "jwt_otc_session"},
+        )
+        # 7. SSO
+        respx_mock.get("https://my.sonjj.com/auth/sonjj?session=jwt_otc_session").respond(
+            status_code=200,
+            headers={"Set-Cookie": "my_session=otc_sso_val; Domain=my.sonjj.com; Path=/"},
+        )
+        # 8. SmailPro temporary-email
+        respx_mock.get("https://smailpro.com/temporary-email").respond(
+            status_code=200,
+            headers=[
+                ("Set-Cookie", "XSRF-TOKEN=otc_xsrf_val; Path=/"),
+                ("Set-Cookie", "sonjj_session=otc_session_val; Path=/"),
+            ],
+        )
+
+        xsrf, session = await manager._execute_cookie_flow()
+        assert xsrf == "otc_xsrf_val"
+        assert session == "otc_session_val"
+
+
+async def test_full_cookie_flow_integrity_token_rejected(monkeypatch):
+    import httpx
+    import respx
+
+    manager = make_manager(monkeypatch)
+
+    async with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get("https://sonjj.com/members/api/integrity-token/").respond(status_code=403)
+        with pytest.raises(CookieRefreshError) as exc_info:
+            await manager._execute_cookie_flow()
+        assert exc_info.value.stage == cm_mod.CookieRefreshStage.MAGIC_LINK_REQUEST
+
+
+
+
+
+
+

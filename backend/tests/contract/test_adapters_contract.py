@@ -328,3 +328,36 @@ async def test_redaction_guard_no_secret_in_logs(monkeypatch, caplog):
 
     for secret in secrets:
         assert secret not in blob, f"secret leaked into logs: {secret}"
+
+
+def test_normalize_requested_domain():
+    from app.integrations.domains import normalize_requested_domain
+
+    assert normalize_requested_domain("outlook") == "outlook.com"
+    assert normalize_requested_domain("outlook.com") == "outlook.com"
+    assert normalize_requested_domain("gmail") == "gmail.com"
+    assert normalize_requested_domain("gmail.com") == "gmail.com"
+    assert normalize_requested_domain("@hotmail") == "hotmail.com"
+    assert normalize_requested_domain("") == "outlook.com"
+    assert normalize_requested_domain(None) == "outlook.com"
+
+
+async def test_smailpro_headers_has_user_agent_and_normalizes_domain(monkeypatch):
+    from app.integrations.smailpro import _smailpro_headers
+
+    headers = _smailpro_headers()
+    assert "user-agent" in headers
+    assert "Mozilla" in headers["user-agent"]
+
+    recorded_params = []
+
+    def route(req: httpx.Request) -> httpx.Response:
+        recorded_params.append(dict(req.url.params))
+        assert "user-agent" in req.headers
+        return _json_response("create_top_level.json")
+
+    _install_transport(monkeypatch, route)
+    adapter = SmailProAdapter()
+    await adapter.create(domain="outlook")
+    assert recorded_params[0]["domain"] == "outlook.com"
+

@@ -401,7 +401,12 @@ class MessageService:
         if already_charged:
             detail, from_cache = await self._get_detail(inbox, mid)
             return self._detail_to_dto(
-                detail, mid, charged=False, amount=amount, from_cache=from_cache
+                detail,
+                mid,
+                charged=False,
+                amount=amount,
+                from_cache=from_cache,
+                known_message=known,
             )
 
         # --- Step 3: fetch + validate + sanitize + cache the detail ----------
@@ -426,7 +431,12 @@ class MessageService:
                 # return the detail without charging.
                 await self.session.commit()
                 return self._detail_to_dto(
-                    detail, mid, charged=False, amount=amount, from_cache=from_cache
+                    detail,
+                    mid,
+                    charged=False,
+                    amount=amount,
+                    from_cache=from_cache,
+                    known_message=known,
                 )
 
             # Step 6: lock the wallet, verify affordability, debit + ledger.
@@ -450,7 +460,14 @@ class MessageService:
 
             # Step 8: commit, THEN report charged=True.
             await self.session.commit()
-            return self._detail_to_dto(detail, mid, charged=True, amount=amount, from_cache=from_cache)
+            return self._detail_to_dto(
+                detail,
+                mid,
+                charged=True,
+                amount=amount,
+                from_cache=from_cache,
+                known_message=known,
+            )
         except Exception:
             # Step 7: any failure rolls back the whole transaction so the
             # billing_read insert + any debit are undone; never charge on error.
@@ -520,6 +537,7 @@ class MessageService:
         charged: bool,
         amount: int,
         from_cache: bool = False,
+        known_message: Any = None,
     ) -> dto.MessageDetailDTO:
         """Build the client-facing detail DTO with billing info attached.
 
@@ -536,11 +554,21 @@ class MessageService:
         # P0-01: billing.source is 'cache' if from_cache, else 'upstream'
         billing_source = "cache" if from_cache else "upstream"
 
+        subject = detail.get("subject") or (
+            known_message.subject_sanitized if known_message else None
+        )
+        sender = detail.get("sender") or (
+            known_message.sender_sanitized if known_message else None
+        )
+        received_at = _parse_received_at(detail.get("date")) or (
+            known_message.received_at if known_message else None
+        )
+
         return dto.MessageDetailDTO(
             mid=detail.get("mid") or mid,
-            subject=(detail.get("subject") or None),
-            sender=(detail.get("sender") or None),
-            received_at=_parse_received_at(detail.get("date")),
+            subject=subject or None,
+            sender=sender or None,
+            received_at=received_at,
             html_sanitized=(detail.get("body_html") or None),
             otp_candidates=otp_candidates,
             billing=dto.BillingInfo(charged=charged, amount=amount, source=billing_source),

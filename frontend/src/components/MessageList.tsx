@@ -21,7 +21,7 @@ export function MessageList({ inboxId, messages }: MessageListProps) {
             <div className="message-meta">
               <span className="message-sender">{m.sender}</span>
               <span className="message-date">
-                {new Date(m.received_at).toLocaleString()}
+                {m.received_at ? new Date(m.received_at).toLocaleString() : ''}
               </span>
             </div>
             {m.snippet && <div className="message-snippet">{m.snippet}</div>}

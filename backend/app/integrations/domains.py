@@ -55,3 +55,29 @@ def get_sonjj_endpoint(email_address: str) -> Tuple[str, str, str]:
     inbox_url = f"{SONJJ_API_BASE}/v1/{endpoint}/inbox"
     message_url = f"{SONJJ_API_BASE}/v1/{endpoint}/message"
     return inbox_url, message_url, endpoint
+
+
+_DOMAIN_ALIASES: dict[str, str] = {
+    "outlook": "outlook.com",
+    "hotmail": "hotmail.com",
+    "live": "live.com",
+    "msn": "msn.com",
+    "gmail": "gmail.com",
+    "google": "gmail.com",
+    "googlemail": "googlemail.com",
+    "yahoo": "yahoo.com",
+    "ymail": "ymail.com",
+    "mailru": "mail.ru",
+    "icloud": "icloud.com",
+}
+
+
+def normalize_requested_domain(domain: str | None) -> str:
+    """Normalize user-supplied domain input (e.g. 'outlook' -> 'outlook.com')."""
+    if not domain:
+        return "outlook.com"
+    d = domain.strip().lower()
+    if d.startswith("@"):
+        d = d[1:]
+    return _DOMAIN_ALIASES.get(d, d)
+

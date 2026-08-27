@@ -66,8 +66,8 @@ export function MessageDetailPage() {
           <header>
             <h1>{detail.subject || '(no subject)'}</h1>
             <div className="muted">
-              From <strong>{detail.sender}</strong> ·{' '}
-              {new Date(detail.received_at).toLocaleString()}
+              From <strong>{detail.sender || '(unknown)'}</strong> ·{' '}
+              {detail.received_at ? new Date(detail.received_at).toLocaleString() : ''}
             </div>
 
             <div className="billing-indicator">

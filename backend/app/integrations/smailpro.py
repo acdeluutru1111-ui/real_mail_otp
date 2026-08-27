@@ -25,7 +25,8 @@ from app.core.config import get_settings
 from app.core.errors import AppError, UpstreamAuthError, UpstreamBadResponseError
 from app.core.logging import get_logger
 from app.integrations import http_client
-from app.integrations.cookie_manager import get_cookie_manager
+from app.integrations.cookie_manager import CookieRefreshError, get_cookie_manager
+from app.integrations.domains import normalize_requested_domain
 
 logger = get_logger("integrations.smailpro")
 
@@ -48,6 +49,11 @@ def _smailpro_headers(origin: bool = False) -> Dict[str, str]:
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
     }
     if origin:
         headers["origin"] = SMAILPRO_BASE
@@ -96,9 +102,12 @@ class SmailProAdapter:
         except UpstreamAuthError:
             if not self._settings.cookie_auto_refresh_enabled:
                 raise
-            refreshed = await self._cookie_manager.refresh_cookies(
-                force=True, stale_generation=generation
-            )
+            try:
+                refreshed = await self._cookie_manager.refresh_cookies(
+                    force=True, stale_generation=generation
+                )
+            except CookieRefreshError:
+                raise UpstreamAuthError()
             kwargs["cookies"] = refreshed.as_dict_for_requests()
             return await http_client.request(method, url, **kwargs)
 
@@ -127,10 +136,11 @@ class SmailProAdapter:
         exhaustion. Never logs the address/key/cookies.
         """
         settings = self._settings
+        normalized_domain = normalize_requested_domain(domain)
         params = {
             "username": username,
             "type": email_type,
-            "domain": domain,
+            "domain": normalized_domain,
             "server": server,
         }
 

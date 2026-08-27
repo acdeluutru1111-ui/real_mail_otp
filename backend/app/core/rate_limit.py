@@ -172,10 +172,10 @@ rate_limiter = InProcessRateLimiter()
 # --- Route -> limits mapping ------------------------------------------------
 # Fallbacks mirror the defaults in Settings so this module works standalone.
 _DEFAULT_PER_MINUTE: Dict[str, int] = {
-    "create": 10,
-    "list": 60,
-    "detail": 30,
-    "refresh": 20,
+    "create": 30,
+    "list": 120,
+    "detail": 60,
+    "refresh": 60,
 }
 
 _ROUTE_TO_FIELD: Dict[str, str] = {

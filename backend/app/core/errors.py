@@ -73,7 +73,7 @@ ERROR_SPECS: dict[str, ErrorSpec] = {
         "PAYMENT_ERROR", 400, False, "Payment could not be processed."
     ),
     "ABUSE_BLOCKED": ErrorSpec(
-        "ABUSE_BLOCKED", 429, False, "Request blocked due to abuse protection."
+        "ABUSE_BLOCKED", 429, True, "Request blocked due to abuse protection."
     ),
     "INTERNAL_ERROR": ErrorSpec(
         "INTERNAL_ERROR", 500, False, "An internal error occurred."
@@ -139,6 +139,23 @@ AbuseBlockedError = _make("ABUSE_BLOCKED")
 InternalErrorError = _make("INTERNAL_ERROR")
 
 
+def _add_cors_headers(request: Request, response: JSONResponse) -> None:
+    """Ensure CORS headers are attached to error responses even when handled outside CORSMiddleware."""
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        origin = request.headers.get("origin")
+        if origin and settings.cors_origins:
+            if origin in settings.cors_origins or "*" in settings.cors_origins:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Vary"] = "Origin"
+                response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+    except Exception:
+        pass
+
+
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     """FastAPI handler rendering the common error envelope.
 
@@ -163,6 +180,7 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
             # Default to 60 seconds if not specified
             response.headers["Retry-After"] = "60"
 
+    _add_cors_headers(request, response)
     return response
 
 
@@ -178,4 +196,7 @@ async def unhandled_exception_handler(
     )
     if request_id:
         response.headers["X-Request-ID"] = request_id
+
+    _add_cors_headers(request, response)
     return response
+

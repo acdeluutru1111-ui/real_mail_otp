@@ -15,7 +15,7 @@ export function InboxesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
 
-  const [domain, setDomain] = useState('outlook');
+  const [domain, setDomain] = useState('outlook.com');
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
@@ -80,7 +80,7 @@ export function InboxesPage() {
           <input
             value={domain}
             onChange={(e) => setDomain(e.target.value)}
-            placeholder="outlook"
+            placeholder="outlook.com"
             required
           />
         </label>

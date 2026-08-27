@@ -287,29 +287,133 @@ class CookieManager:
     
     async def _execute_cookie_flow(
         self,
-        max_wait: int = 60,
-        poll_interval: int = 5,
+        max_wait: float = 60,
+        poll_interval: float = 5,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Execute the staged cookie flow, preserving safe failure metadata."""
         self._flow_started_at = datetime.now(timezone.utc)
-        await self._request_magic_link()
-        signin_url = await self._read_signin_link_async(max_wait, poll_interval)
-        return await self._extract_cookies_from_signin(signin_url)
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Origin": SONJJ_BASE,
+                "Referer": f"{SONJJ_BASE}/redirect-auth/",
+            },
+        ) as client:
+            # Stage 1: Get Ghost integrity token
+            integrity_token = await self._get_integrity_token(client)
 
-    async def _request_magic_link(self) -> None:
-        """Request a magic link and report only safe stage telemetry."""
+            # Stage 2: Send magic link request with integrity token and includeOTC=True
+            otc_ref = await self._request_magic_link(client, integrity_token)
+
+            # Stage 3: Poll Gmail for sign-in link and 6-digit OTC verification code
+            signin_url, otc_code = await self._read_gmail_auth_async(max_wait, poll_interval)
+
+            # Stage 4: Authenticate with Ghost CMS (Direct link primary, OTC fallback)
+            await self._authenticate(
+                client=client,
+                signin_url=signin_url,
+                otc_code=otc_code,
+                otc_ref=otc_ref,
+            )
+
+            # Stage 5 & 6: Session JWT, SSO, and SmailPro cookie pair extraction
+            return await self._extract_cookies_from_session(client)
+
+    async def _get_integrity_token(self, client: httpx.AsyncClient) -> str:
+        """Fetch Ghost integrity token prior to magic link / verify-otc request."""
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"{SONJJ_BASE}/members/api/send-magic-link/",
-                    json={"email": self._gmail_email},
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Origin": SONJJ_BASE,
-                        "Referer": f"{SONJJ_BASE}/redirect-auth/",
-                    },
+            resp = await client.get(
+                f"{SONJJ_BASE}/members/api/integrity-token/",
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    "Origin": SONJJ_BASE,
+                    "Referer": f"{SONJJ_BASE}/redirect-auth/",
+                },
+            )
+            if resp.status_code != 200:
+                if resp.status_code == 429:
+                    reason = CookieRefreshReason.UPSTREAM_RATE_LIMITED
+                elif resp.status_code >= 500:
+                    reason = CookieRefreshReason.UPSTREAM_UNAVAILABLE
+                else:
+                    reason = CookieRefreshReason.UPSTREAM_REJECTED
+                self._telemetry(
+                    CookieRefreshStage.MAGIC_LINK_REQUEST,
+                    "failed",
+                    reason.value,
+                    started,
                 )
+                raise CookieRefreshError(
+                    CookieRefreshStage.MAGIC_LINK_REQUEST,
+                    reason,
+                )
+            token = resp.text.strip()
+            if not token:
+                raise CookieRefreshError(
+                    CookieRefreshStage.MAGIC_LINK_REQUEST,
+                    CookieRefreshReason.UPSTREAM_REJECTED,
+                )
+            return token
+        except CookieRefreshError:
+            raise
+        except Exception as exc:
+            self._telemetry(
+                CookieRefreshStage.MAGIC_LINK_REQUEST,
+                "failed",
+                CookieRefreshReason.NETWORK_ERROR.value,
+                started,
+            )
+            raise CookieRefreshError(
+                CookieRefreshStage.MAGIC_LINK_REQUEST,
+                CookieRefreshReason.NETWORK_ERROR,
+            ) from exc
+
+    async def _request_magic_link(
+        self, client: httpx.AsyncClient, integrity_token: str
+    ) -> Optional[str]:
+        """Request a magic link with integrity token and return otc_ref if available."""
+        started = time.monotonic()
+        try:
+            now_ms = int(time.time() * 1000)
+            payload = {
+                "email": self._gmail_email,
+                "emailType": "signin",
+                "requestSrc": "portal",
+                "integrityToken": integrity_token,
+                "autoRedirect": True,
+                "includeOTC": True,
+                "urlHistory": [
+                    {
+                        "path": "/redirect-auth/",
+                        "time": now_ms,
+                        "referrerUrl": f"{MY_SONJJ_BASE}/",
+                    }
+                ],
+            }
+            resp = await client.post(
+                f"{SONJJ_BASE}/members/api/send-magic-link/",
+                json=payload,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    "Origin": SONJJ_BASE,
+                    "Referer": f"{SONJJ_BASE}/redirect-auth/",
+                },
+            )
             if resp.status_code not in (200, 201):
                 if resp.status_code == 429:
                     reason = CookieRefreshReason.UPSTREAM_RATE_LIMITED
@@ -328,6 +432,16 @@ class CookieManager:
                     reason,
                 )
             self._telemetry(CookieRefreshStage.MAGIC_LINK_REQUEST, "ok", "ok", started)
+            otc_ref = None
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    otc_ref = data.get("otc_ref") or data.get("otcRef")
+                    if not otc_ref and "data" in data and isinstance(data["data"], dict):
+                        otc_ref = data["data"].get("otc_ref") or data["data"].get("otcRef")
+            except Exception:
+                pass
+            return otc_ref
         except CookieRefreshError:
             raise
         except Exception as exc:
@@ -342,13 +456,13 @@ class CookieManager:
                 CookieRefreshReason.NETWORK_ERROR,
             ) from exc
     
-    async def _read_signin_link_async(
+    async def _read_gmail_auth_async(
         self, max_wait: float, poll_interval: float
-    ) -> str:
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Run blocking Gmail IMAP polling in a worker with a finite timeout."""
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._read_signin_link_sync, max_wait, poll_interval),
+                asyncio.to_thread(self._read_gmail_auth_sync, max_wait, poll_interval),
                 timeout=max_wait + self._settings.cookie_imap_timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
@@ -357,8 +471,22 @@ class CookieManager:
                 CookieRefreshReason.POLL_TIMEOUT,
             ) from exc
 
-    def _read_signin_link_sync(self, max_wait: float, poll_interval: float) -> str:
-        """Poll Gmail INBOX without consuming messages or hiding old unread mail."""
+    async def _read_signin_link_async(
+        self, max_wait: float, poll_interval: float
+    ) -> str:
+        """Legacy helper returning signin_url."""
+        signin_url, _ = await self._read_gmail_auth_async(max_wait, poll_interval)
+        if not signin_url:
+            raise CookieRefreshError(
+                CookieRefreshStage.IMAP_POLL,
+                CookieRefreshReason.MESSAGE_NOT_FOUND,
+            )
+        return signin_url
+
+    def _read_gmail_auth_sync(
+        self, max_wait: float, poll_interval: float
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Poll Gmail INBOX for signin URL and 6-digit OTC verification code."""
         deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
             mail = None
@@ -430,13 +558,31 @@ class CookieManager:
                             continue
                     except (TypeError, ValueError, OverflowError):
                         continue
-                    match = re.search(
+
+                    subject = msg.get("Subject", "")
+                    body = self._get_email_body(msg)
+
+                    signin_url = None
+                    otc_code = None
+
+                    match_url = re.search(
                         r'(https://sonjj\.com/members/\?token=[^\s\)"\'>\]]+)',
-                        self._get_email_body(msg),
+                        body,
                     )
-                    if match:
+                    if match_url:
+                        signin_url = match_url.group(1).rstrip(")")
+
+                    match_otc = re.search(r'\b(\d{6})\b', subject)
+                    if match_otc:
+                        otc_code = match_otc.group(1)
+                    else:
+                        match_otc_body = re.search(r'\b(\d{6})\b', body)
+                        if match_otc_body:
+                            otc_code = match_otc_body.group(1)
+
+                    if signin_url or otc_code:
                         self._telemetry(CookieRefreshStage.IMAP_POLL, "ok", "ok", poll_started)
-                        return match.group(1).rstrip(")")
+                        return signin_url, otc_code
             finally:
                 if mail is not None:
                     try:
@@ -457,6 +603,16 @@ class CookieManager:
             CookieRefreshStage.IMAP_POLL,
             CookieRefreshReason.MESSAGE_NOT_FOUND,
         )
+
+    def _read_signin_link_sync(self, max_wait: float, poll_interval: float) -> str:
+        """Legacy helper returning signin_url."""
+        signin_url, _ = self._read_gmail_auth_sync(max_wait, poll_interval)
+        if not signin_url:
+            raise CookieRefreshError(
+                CookieRefreshStage.IMAP_POLL,
+                CookieRefreshReason.MESSAGE_NOT_FOUND,
+            )
+        return signin_url
     
     def _get_email_body(self, msg) -> str:
         """Extract email body (prefer plain text, fallback to HTML)."""
@@ -480,9 +636,90 @@ class CookieManager:
                 body_plain = payload.decode(errors="replace")
         
         return body_plain if body_plain else body_html
+
+    async def _authenticate(
+        self,
+        client: httpx.AsyncClient,
+        signin_url: Optional[str] = None,
+        otc_code: Optional[str] = None,
+        otc_ref: Optional[str] = None,
+    ) -> None:
+        """Authenticate with Ghost CMS via direct sign-in link (Branch A) or OTC fallback (Branch B)."""
+        started = time.monotonic()
+
+        # Branch A: Direct Sign-in link
+        if signin_url:
+            try:
+                resp = await client.get(signin_url)
+                if resp.status_code < 400:
+                    self._telemetry(CookieRefreshStage.SIGNIN, "ok", "ok", started)
+                    return
+            except Exception:
+                pass
+
+        # Branch B: OTC Code Fallback
+        if otc_code and otc_ref:
+            try:
+                fresh_integrity_token = await self._get_integrity_token(client)
+                otc_payload = {
+                    "otc": otc_code,
+                    "otcRef": otc_ref,
+                    "integrityToken": fresh_integrity_token,
+                }
+                resp = await client.post(
+                    f"{SONJJ_BASE}/members/api/verify-otc/",
+                    json=otc_payload,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/126.0.0.0 Safari/537.36"
+                        ),
+                        "Origin": SONJJ_BASE,
+                        "Referer": f"{SONJJ_BASE}/redirect-auth/",
+                    },
+                )
+                if resp.status_code in (200, 201):
+                    self._telemetry(CookieRefreshStage.SIGNIN, "ok", "ok", started)
+                    return
+                self._telemetry(
+                    CookieRefreshStage.SIGNIN,
+                    "failed",
+                    CookieRefreshReason.MAGIC_LINK_INVALID.value,
+                    started,
+                )
+                raise CookieRefreshError(
+                    CookieRefreshStage.SIGNIN,
+                    CookieRefreshReason.MAGIC_LINK_INVALID,
+                )
+            except CookieRefreshError:
+                raise
+            except Exception as exc:
+                self._telemetry(
+                    CookieRefreshStage.SIGNIN,
+                    "failed",
+                    CookieRefreshReason.NETWORK_ERROR.value,
+                    started,
+                )
+                raise CookieRefreshError(
+                    CookieRefreshStage.SIGNIN,
+                    CookieRefreshReason.NETWORK_ERROR,
+                ) from exc
+
+        # If neither branch succeeded or was available
+        self._telemetry(
+            CookieRefreshStage.SIGNIN,
+            "failed",
+            CookieRefreshReason.MAGIC_LINK_INVALID.value,
+            started,
+        )
+        raise CookieRefreshError(
+            CookieRefreshStage.SIGNIN,
+            CookieRefreshReason.MAGIC_LINK_INVALID,
+        )
     
     async def _extract_cookies_from_signin(self, signin_url: str) -> Tuple[str, str]:
-        """Run sign-in, session, SSO, and SmailPro stages with safe errors."""
+        """Legacy helper running sign-in and session cookie extraction."""
         async with httpx.AsyncClient(
             timeout=15.0,
             follow_redirects=True,
@@ -496,153 +733,168 @@ class CookieManager:
                 "Referer": f"{SONJJ_BASE}/redirect-auth/",
             },
         ) as client:
-            started = time.monotonic()
-            try:
-                resp = await client.get(signin_url)
-                if resp.status_code >= 400:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SIGNIN,
-                        CookieRefreshReason.MAGIC_LINK_INVALID,
-                    )
-                self._telemetry(CookieRefreshStage.SIGNIN, "ok", "ok", started)
-            except CookieRefreshError:
-                self._telemetry(
-                    CookieRefreshStage.SIGNIN,
-                    "failed",
-                    CookieRefreshReason.MAGIC_LINK_INVALID.value,
-                    started,
-                )
-                raise
-            except Exception as exc:
-                self._telemetry(
-                    CookieRefreshStage.SIGNIN,
-                    "failed",
-                    CookieRefreshReason.NETWORK_ERROR.value,
-                    started,
-                )
-                raise CookieRefreshError(
-                    CookieRefreshStage.SIGNIN,
-                    CookieRefreshReason.NETWORK_ERROR,
-                ) from exc
+            await self._authenticate(client, signin_url=signin_url)
+            return await self._extract_cookies_from_session(client)
 
-            started = time.monotonic()
-            try:
-                session_resp = await client.get(f"{SONJJ_BASE}/members/api/session")
-                if session_resp.status_code != 200:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SESSION,
-                        CookieRefreshReason.SESSION_REJECTED,
-                    )
-                jwt_token = None
-                try:
-                    data = session_resp.json()
-                    if isinstance(data, dict):
-                        jwt_token = data.get("jwt")
-                except Exception:
-                    text = session_resp.text.strip()
-                    if text.count(".") >= 2 and len(text) > 50:
-                        jwt_token = text
-                if not jwt_token:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SESSION,
-                        CookieRefreshReason.SESSION_INVALID,
-                    )
-                self._telemetry(CookieRefreshStage.SESSION, "ok", "ok", started)
-            except CookieRefreshError as exc:
-                self._telemetry(
-                    CookieRefreshStage.SESSION,
-                    "failed",
-                    exc.reason_code.value,
-                    started,
-                )
-                raise
-            except Exception as exc:
-                self._telemetry(
-                    CookieRefreshStage.SESSION,
-                    "failed",
-                    CookieRefreshReason.NETWORK_ERROR.value,
-                    started,
-                )
+    async def _extract_cookies_from_session(self, client: httpx.AsyncClient) -> Tuple[str, str]:
+        """Run session JWT, SSO, and SmailPro stages on the authenticated client."""
+        started = time.monotonic()
+        try:
+            session_resp = await client.get(f"{SONJJ_BASE}/members/api/session")
+            if session_resp.status_code != 200:
                 raise CookieRefreshError(
                     CookieRefreshStage.SESSION,
-                    CookieRefreshReason.NETWORK_ERROR,
-                ) from exc
-
-            started = time.monotonic()
+                    CookieRefreshReason.SESSION_REJECTED,
+                )
+            jwt_token = None
             try:
-                sso_resp = await client.get(
-                    f"{MY_SONJJ_BASE}/auth/sonjj",
-                    params={"session": jwt_token},
+                data = session_resp.json()
+                if isinstance(data, dict):
+                    jwt_token = data.get("jwt")
+            except Exception:
+                text = session_resp.text.strip()
+                if text.count(".") >= 2 and len(text) > 50:
+                    jwt_token = text
+            if not jwt_token:
+                raise CookieRefreshError(
+                    CookieRefreshStage.SESSION,
+                    CookieRefreshReason.SESSION_INVALID,
                 )
-                if sso_resp.status_code >= 400:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SSO,
-                        CookieRefreshReason.SSO_REJECTED,
-                    )
-                self._telemetry(CookieRefreshStage.SSO, "ok", "ok", started)
-            except CookieRefreshError:
-                self._telemetry(
-                    CookieRefreshStage.SSO,
-                    "failed",
-                    CookieRefreshReason.SSO_REJECTED.value,
-                    started,
-                )
-                raise
-            except Exception as exc:
-                self._telemetry(
-                    CookieRefreshStage.SSO,
-                    "failed",
-                    CookieRefreshReason.NETWORK_ERROR.value,
-                    started,
-                )
+            self._telemetry(CookieRefreshStage.SESSION, "ok", "ok", started)
+        except CookieRefreshError as exc:
+            self._telemetry(
+                CookieRefreshStage.SESSION,
+                "failed",
+                exc.reason_code.value,
+                started,
+            )
+            raise
+        except Exception as exc:
+            self._telemetry(
+                CookieRefreshStage.SESSION,
+                "failed",
+                CookieRefreshReason.NETWORK_ERROR.value,
+                started,
+            )
+            raise CookieRefreshError(
+                CookieRefreshStage.SESSION,
+                CookieRefreshReason.NETWORK_ERROR,
+            ) from exc
+
+        started = time.monotonic()
+        try:
+            sso_resp = await client.get(
+                f"{MY_SONJJ_BASE}/auth/sonjj",
+                params={"session": jwt_token},
+            )
+            if sso_resp.status_code >= 400:
                 raise CookieRefreshError(
                     CookieRefreshStage.SSO,
-                    CookieRefreshReason.NETWORK_ERROR,
-                ) from exc
+                    CookieRefreshReason.SSO_REJECTED,
+                )
+            self._telemetry(CookieRefreshStage.SSO, "ok", "ok", started)
+        except CookieRefreshError:
+            self._telemetry(
+                CookieRefreshStage.SSO,
+                "failed",
+                CookieRefreshReason.SSO_REJECTED.value,
+                started,
+            )
+            raise
+        except Exception as exc:
+            self._telemetry(
+                CookieRefreshStage.SSO,
+                "failed",
+                CookieRefreshReason.NETWORK_ERROR.value,
+                started,
+            )
+            raise CookieRefreshError(
+                CookieRefreshStage.SSO,
+                CookieRefreshReason.NETWORK_ERROR,
+            ) from exc
 
-            started = time.monotonic()
-            try:
-                # Keep httpx's cookie jar so domain/path rules and redirects are
-                # handled by the client instead of flattening a raw Cookie header.
-                smail_resp = await client.get(f"{SMAILPRO_BASE}/temporary-email")
-                if smail_resp.status_code >= 400:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SMAILPRO_COOKIE,
-                        CookieRefreshReason.UPSTREAM_REJECTED,
-                    )
-                xsrf_token = None
-                sonjj_session = None
-                for cookie in client.cookies.jar:
-                    if cookie.name == "XSRF-TOKEN" and not xsrf_token:
-                        xsrf_token = urllib.parse.unquote(cookie.value)
-                    elif cookie.name == "sonjj_session" and not sonjj_session:
-                        sonjj_session = cookie.value
-                if not xsrf_token or not sonjj_session:
-                    raise CookieRefreshError(
-                        CookieRefreshStage.SMAILPRO_COOKIE,
-                        CookieRefreshReason.COOKIE_PAIR_MISSING,
-                    )
-                self._telemetry(CookieRefreshStage.SMAILPRO_COOKIE, "ok", "ok", started)
-                return xsrf_token, sonjj_session
-            except CookieRefreshError as exc:
-                self._telemetry(
-                    CookieRefreshStage.SMAILPRO_COOKIE,
-                    "failed",
-                    exc.reason_code.value,
-                    started,
-                )
-                raise
-            except Exception as exc:
-                self._telemetry(
-                    CookieRefreshStage.SMAILPRO_COOKIE,
-                    "failed",
-                    CookieRefreshReason.NETWORK_ERROR.value,
-                    started,
-                )
+        started = time.monotonic()
+        try:
+            # Forward accumulated cookies (from .sonjj.com, my.sonjj.com)
+            # to bridge the session across to smailpro.com domain
+            cookie_parts = []
+            for cookie in client.cookies.jar:
+                cookie_parts.append(f"{cookie.name}={cookie.value}")
+            cookie_header = "; ".join(cookie_parts)
+
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+            }
+            if cookie_header:
+                headers["cookie"] = cookie_header
+
+            smail_resp = await client.get(
+                f"{SMAILPRO_BASE}/temporary-email",
+                headers=headers,
+            )
+            if smail_resp.status_code >= 400:
                 raise CookieRefreshError(
                     CookieRefreshStage.SMAILPRO_COOKIE,
-                    CookieRefreshReason.NETWORK_ERROR,
-                ) from exc
+                    CookieRefreshReason.UPSTREAM_REJECTED,
+                )
+            xsrf_token = None
+            sonjj_session = None
+
+            # Primary extraction: client cookie jar and response cookies
+            for cookie in client.cookies.jar:
+                if cookie.name == "XSRF-TOKEN" and not xsrf_token:
+                    xsrf_token = urllib.parse.unquote(cookie.value)
+                elif cookie.name == "sonjj_session" and not sonjj_session:
+                    sonjj_session = cookie.value
+
+            for name, value in smail_resp.cookies.items():
+                if name == "XSRF-TOKEN" and not xsrf_token:
+                    xsrf_token = urllib.parse.unquote(value)
+                elif name == "sonjj_session" and not sonjj_session:
+                    sonjj_session = value
+
+            # Fallback extraction: parse Set-Cookie headers directly
+            for header_val in smail_resp.headers.get_list("set-cookie"):
+                for part in header_val.split(","):
+                    if "XSRF-TOKEN=" in part and not xsrf_token:
+                        m = re.search(r"XSRF-TOKEN=([^;]+)", part)
+                        if m:
+                            xsrf_token = urllib.parse.unquote(m.group(1).strip())
+                    if "sonjj_session=" in part and not sonjj_session:
+                        m = re.search(r"sonjj_session=([^;]+)", part)
+                        if m:
+                            sonjj_session = m.group(1).strip()
+
+            if not xsrf_token or not sonjj_session:
+                raise CookieRefreshError(
+                    CookieRefreshStage.SMAILPRO_COOKIE,
+                    CookieRefreshReason.COOKIE_PAIR_MISSING,
+                )
+            self._telemetry(CookieRefreshStage.SMAILPRO_COOKIE, "ok", "ok", started)
+            return xsrf_token, sonjj_session
+        except CookieRefreshError as exc:
+            self._telemetry(
+                CookieRefreshStage.SMAILPRO_COOKIE,
+                "failed",
+                exc.reason_code.value,
+                started,
+            )
+            raise
+        except Exception as exc:
+            self._telemetry(
+                CookieRefreshStage.SMAILPRO_COOKIE,
+                "failed",
+                CookieRefreshReason.NETWORK_ERROR.value,
+                started,
+            )
+            raise CookieRefreshError(
+                CookieRefreshStage.SMAILPRO_COOKIE,
+                CookieRefreshReason.NETWORK_ERROR,
+            ) from exc
     
     async def _load_from_file(self) -> Optional[CookieData]:
         """Read a pre-existing legacy plaintext cache for migration only."""
